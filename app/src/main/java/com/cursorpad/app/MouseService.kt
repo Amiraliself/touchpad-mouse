@@ -2,7 +2,14 @@ package com.cursorpad.app
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.content.res.Configuration
 import android.graphics.Path
@@ -10,6 +17,7 @@ import android.graphics.PixelFormat
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.util.DisplayMetrics
@@ -17,6 +25,7 @@ import android.view.Gravity
 import android.view.WindowManager
 import android.view.WindowManager.LayoutParams as LP
 import android.view.accessibility.AccessibilityEvent
+import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
@@ -27,18 +36,32 @@ class MouseService : AccessibilityService(), PadListener {
         @Volatile
         var instance: MouseService? = null
 
-        private const val NATURAL_SCROLL = true
-        private const val SCROLL_GAIN = 2.2f
-        private const val G_NONE = 0
-        private const val G_DRAG = 1
-        private const val G_SCROLL = 2
+        private const val ACTION_TOGGLE = "com.cursorpad.app.TOGGLE"
+        private const val CHANNEL = "cursorpad_channel"
+        private const val NOTIF_ID = 7
     }
+
+    private class Job(
+        val g: GestureDescription,
+        val minX: Float,
+        val minY: Float,
+        val maxX: Float,
+        val maxY: Float,
+        val durMs: Long,
+        val next: Job? = null
+    )
 
     private lateinit var st: Prefs
     private lateinit var wm: WindowManager
     private val handler = Handler(Looper.getMainLooper())
     private val prefListener =
         SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> reload() }
+
+    private val toggleReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            st.enabled = !st.enabled
+        }
+    }
 
     private var cursor: CursorView? = null
     private var pad: TouchpadView? = null
@@ -50,24 +73,21 @@ class MouseService : AccessibilityService(), PadListener {
     private var curX = 0f
     private var curY = 0f
 
-    private var gMode = G_NONE
-    private var gActive = false
-    private var gBusy = false
-    private var gEnding = false
-    private var gStroke: GestureDescription.StrokeDescription? = null
-    private var gLastX = 0f
-    private var gLastY = 0f
-    private var gTx = 0f
-    private var gTy = 0f
-    private var tapInFlight = false
-    private var dragSkipped = false
+    private val queue = ArrayDeque<Job>()
+    private var running = false
+
+    private var dragging = false
     private var dragMoved = false
-    private var originX = 0f
-    private var originY = 0f
-    private var accX = 0f
-    private var accY = 0f
+    private var dragT0 = 0L
+    private var dragStartX = 0f
+    private var dragStartY = 0f
+    private val dragPts = ArrayList<Float>()
+
     private var padStartX = 0
     private var padStartY = 0
+    private var notifKey = -1
+
+    // ================= چرخه‌ی عمر =================
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -75,6 +95,7 @@ class MouseService : AccessibilityService(), PadListener {
         st = Prefs(this)
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         st.prefs.registerOnSharedPreferenceChangeListener(prefListener)
+        registerToggle()
         readScreen()
         curX = screenW / 2f
         curY = screenH / 2f
@@ -95,7 +116,7 @@ class MouseService : AccessibilityService(), PadListener {
         }, 200)
     }
 
-    override fun onUnbind(intent: android.content.Intent?): Boolean {
+    override fun onUnbind(intent: Intent?): Boolean {
         shutdown()
         return super.onUnbind(intent)
     }
@@ -105,12 +126,27 @@ class MouseService : AccessibilityService(), PadListener {
         super.onDestroy()
     }
 
+    @Suppress("DEPRECATION")
     private fun shutdown() {
         if (::st.isInitialized) {
             st.prefs.unregisterOnSharedPreferenceChangeListener(prefListener)
         }
+        runCatching { unregisterReceiver(toggleReceiver) }
         removeOverlays()
+        runCatching { stopForeground(true) }
+        notifKey = -1
         instance = null
+    }
+
+    private fun registerToggle() {
+        val f = IntentFilter(ACTION_TOGGLE)
+        runCatching {
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(toggleReceiver, f, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                registerReceiver(toggleReceiver, f)
+            }
+        }
     }
 
     fun reload() {
@@ -123,8 +159,48 @@ class MouseService : AccessibilityService(), PadListener {
                 if (!shown) addOverlays()
                 updateVisuals()
             }
+            updateNotification()
         }
     }
+
+    // ================= اعلان ثابت =================
+
+    @Suppress("DEPRECATION")
+    private fun updateNotification() {
+        val key = (if (st.notif) 2 else 0) + (if (st.enabled) 1 else 0)
+        if (key == notifKey) return
+        notifKey = key
+        if (!st.notif) {
+            runCatching { stopForeground(true) }
+            return
+        }
+        runCatching {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.createNotificationChannel(
+                NotificationChannel(CHANNEL, "نشانگر موس", NotificationManager.IMPORTANCE_LOW)
+            )
+            val flags = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            val openIntent = Intent(this, MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            val open = PendingIntent.getActivity(this, 0, openIntent, flags)
+            val tog = PendingIntent.getBroadcast(
+                this, 1, Intent(ACTION_TOGGLE).setPackage(packageName), flags
+            )
+            val on = st.enabled
+            val n = Notification.Builder(this, CHANNEL)
+                .setSmallIcon(R.drawable.ic_tile)
+                .setContentTitle("نشانگر موس")
+                .setContentText(if (on) "روشن است" else "خاموش است")
+                .setContentIntent(open)
+                .setOngoing(true)
+                .addAction(R.drawable.ic_tile, if (on) "خاموش کردن" else "روشن کردن", tog)
+                .build()
+            val ok = runCatching { startForeground(NOTIF_ID, n) }.isSuccess
+            if (!ok) nm.notify(NOTIF_ID, n)
+        }
+    }
+
+    // ================= پنجره‌ها =================
 
     @Suppress("DEPRECATION")
     private fun readScreen() {
@@ -143,6 +219,7 @@ class MouseService : AccessibilityService(), PadListener {
     private fun addOverlays() {
         val dens = resources.displayMetrics.density
 
+        // تاچ‌پد (با FLAG_SECURE تا توی فیلم صفحه ضبط نشود)
         val tv = TouchpadView(this, this)
         val pw = (st.padWidthDp * dens).toInt()
         val plp = LP(
@@ -158,6 +235,7 @@ class MouseService : AccessibilityService(), PadListener {
         placePad()
         wm.addView(tv, plp)
 
+        // نشانگر (تمام‌صفحه، غیرقابل‌لمس، روی تاچ‌پد)
         val cv = CursorView(this)
         val clp = LP(
             LP.MATCH_PARENT, LP.MATCH_PARENT,
@@ -167,8 +245,7 @@ class MouseService : AccessibilityService(), PadListener {
             PixelFormat.TRANSLUCENT
         )
         if (Build.VERSION.SDK_INT >= 28) {
-            clp.layoutInDisplayCutoutMode =
-                LP.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            clp.layoutInDisplayCutoutMode = LP.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
         }
         cursor = cv
         wm.addView(cv, clp)
@@ -176,15 +253,16 @@ class MouseService : AccessibilityService(), PadListener {
     }
 
     private fun removeOverlays() {
-        gReset()
         handler.removeCallbacksAndMessages(null)
+        queue.clear()
+        running = false
+        dragging = false
         cursor?.let { v -> runCatching { wm.removeView(v) } }
         pad?.let { v -> runCatching { wm.removeView(v) } }
         cursor = null
         pad = null
         padLp = null
         shown = false
-        tapInFlight = false
     }
 
     private fun landscape() = screenW > screenH
@@ -212,13 +290,20 @@ class MouseService : AccessibilityService(), PadListener {
         cursor?.let {
             it.shape = st.shape
             it.black = st.black
+            it.shadow = st.shadow
             it.sizePx = st.sizeDp * dens
+            it.animStyle = st.clickAnim
+            it.animColor = Themes.accents[st.clickColor.coerceIn(0, Themes.accents.size - 1)]
+            it.alpha = st.cursorAlpha / 100f
         }
         val lp = padLp
         val pv = pad
         if (lp != null && pv != null) {
             pv.alpha = st.padAlpha / 100f
             pv.edgeEnabled = st.edge
+            pv.locked = st.padLocked
+            pv.rightBtn = st.rightBtn
+            pv.themeIndex = st.padTheme
             lp.width = (st.padWidthDp * dens).toInt()
             lp.height = (lp.width * 0.62f).toInt()
             placePad()
@@ -240,11 +325,11 @@ class MouseService : AccessibilityService(), PadListener {
         runCatching { wm.updateViewLayout(v, lp) }
     }
 
-    private fun underPad(x: Float, y: Float): Boolean {
+    private fun hitsPad(x0: Float, y0: Float, x1: Float, y1: Float): Boolean {
         val lp = padLp ?: return false
-        val m = 6f * resources.displayMetrics.density
-        return x >= lp.x - m && x <= lp.x + lp.width + m &&
-            y >= lp.y - m && y <= lp.y + lp.height + m
+        val m = 8f * resources.displayMetrics.density
+        return x1 >= lp.x - m && x0 <= lp.x + lp.width + m &&
+            y1 >= lp.y - m && y0 <= lp.y + lp.height + m
     }
 
     private fun haptic() {
@@ -256,129 +341,71 @@ class MouseService : AccessibilityService(), PadListener {
         }
     }
 
-    private fun gIdle() = !gActive && !gBusy && !tapInFlight
+    // ================= صف ژست‌ها (بعد از برداشتن انگشت اجرا می‌شوند) =================
 
-    private fun gReset() {
-        gActive = false
-        gEnding = false
-        gStroke = null
-        gMode = G_NONE
+    private inner class Runner(val j: Job) {
+        var done = false
+        val failsafe = Runnable { finish(false) }
+
+        fun finish(ok: Boolean) {
+            if (done) return
+            done = true
+            handler.removeCallbacks(failsafe)
+            val n = j.next
+            if (ok && n != null) queue.addFirst(n)
+            runNext()
+        }
+
+        fun start() {
+            val ok = dispatchGesture(j.g, object : AccessibilityService.GestureResultCallback() {
+                override fun onCompleted(gestureDescription: GestureDescription?) {
+                    finish(true)
+                }
+
+                override fun onCancelled(gestureDescription: GestureDescription?) {
+                    finish(false)
+                }
+            }, handler)
+            if (ok) {
+                handler.postDelayed(failsafe, j.durMs + 1500L)
+            } else {
+                finish(false)
+            }
+        }
     }
 
-    private fun gStart(x: Float, y: Float): Boolean {
-        if (!gIdle()) return false
-        gActive = true
-        gEnding = false
-        gLastX = x
-        gLastY = y
-        gTx = x
-        gTy = y
-        val s = GestureDescription.StrokeDescription(Path().apply { moveTo(x, y) }, 0, 50, true)
-        gStroke = s
-        gDispatch(s)
-        return true
+    private fun enqueue(j: Job) {
+        queue.addLast(j)
+        if (!running) runNext()
     }
 
-    private fun gMove(x: Float, y: Float) {
-        if (!gActive) return
-        gTx = x
-        gTy = y
-        if (!gBusy) gPump()
-    }
-
-    private fun gEnd() {
-        if (!gActive) return
-        gEnding = true
-        if (!gBusy) gPump()
-    }
-
-    private fun gPump() {
-        if (!gActive || gBusy) return
-        val prev = gStroke
-        if (prev == null) {
-            gReset()
+    private fun runNext() {
+        val j = queue.removeFirstOrNull()
+        if (j == null) {
+            running = false
+            setPadTouchable(true)
             return
         }
-        val moved = gTx != gLastX || gTy != gLastY
-        if (!moved && !gEnding) return
-        val p = Path()
-        p.moveTo(gLastX, gLastY)
-        var dur = 10L
-        if (moved) {
-            p.lineTo(gTx, gTy)
-            dur = (hypot(gTx - gLastX, gTy - gLastY) / 2f).toLong().coerceIn(10L, 120L)
-        }
-        val cont = !gEnding
-        val s = try {
-            prev.continueStroke(p, 0, dur, cont)
-        } catch (ex: Exception) {
-            gReset()
-            return
-        }
-        gLastX = gTx
-        gLastY = gTy
-        if (cont) {
-            gStroke = s
+        running = true
+        if (hitsPad(j.minX, j.minY, j.maxX, j.maxY)) {
+            setPadTouchable(false)
+            handler.postDelayed({ Runner(j).start() }, 50L)
         } else {
-            gStroke = null
-            gActive = false
-            gMode = G_NONE
-        }
-        gDispatch(s)
-    }
-
-    private fun gDispatch(s: GestureDescription.StrokeDescription) {
-        gBusy = true
-        val g = GestureDescription.Builder().addStroke(s).build()
-        val ok = dispatchGesture(g, object : AccessibilityService.GestureResultCallback() {
-            override fun onCompleted(gestureDescription: GestureDescription?) {
-                gBusy = false
-                gPump()
-            }
-
-            override fun onCancelled(gestureDescription: GestureDescription?) {
-                gBusy = false
-                if (gActive) gReset()
-            }
-        }, handler)
-        if (!ok) {
-            gBusy = false
-            gReset()
+            Runner(j).start()
         }
     }
 
     private fun clickAt(x: Float, y: Float, dur: Long) {
-        if (!gIdle()) return
-        tapInFlight = true
         haptic()
         cursor?.click()
-        val under = underPad(x, y)
-        if (under) setPadTouchable(false)
-
-        val finish = Runnable {
-            tapInFlight = false
-            setPadTouchable(true)
-        }
-        handler.postDelayed({
-            val p = Path().apply { moveTo(x, y) }
-            val g = GestureDescription.Builder()
-                .addStroke(GestureDescription.StrokeDescription(p, 0, dur))
-                .build()
-            val ok = dispatchGesture(g, object : AccessibilityService.GestureResultCallback() {
-                override fun onCompleted(gestureDescription: GestureDescription?) {
-                    handler.removeCallbacks(finish)
-                    finish.run()
-                }
-
-                override fun onCancelled(gestureDescription: GestureDescription?) {
-                    handler.removeCallbacks(finish)
-                    finish.run()
-                }
-            }, handler)
-            if (!ok) finish.run()
-        }, if (under) 50L else 0L)
-        handler.postDelayed(finish, dur + 900L)
+        val p = Path().apply { moveTo(x, y) }
+        val g = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(p, 0L, dur))
+            .build()
+        enqueue(Job(g, x, y, x, y, dur))
     }
+
+    // ================= PadListener =================
 
     override fun onMove(dx: Float, dy: Float, dtMs: Long) {
         var f = st.speed
@@ -389,10 +416,7 @@ class MouseService : AccessibilityService(), PadListener {
         curX = (curX + dx * f).coerceIn(0f, screenW - 1f)
         curY = (curY + dy * f).coerceIn(0f, screenH - 1f)
         cursor?.moveTo(curX, curY)
-        if (gMode == G_DRAG) {
-            dragMoved = true
-            gMove(curX, curY)
-        }
+        if (dragging) recordDrag()
     }
 
     override fun onTap() {
@@ -403,47 +427,146 @@ class MouseService : AccessibilityService(), PadListener {
         clickAt(curX, curY, 650L)
     }
 
-    override fun onDragStart() {
-        dragMoved = false
-        dragSkipped = true
-        if (underPad(curX, curY) || !gIdle()) return
-        if (gStart(curX, curY)) {
-            gMode = G_DRAG
-            dragSkipped = false
-            haptic()
+    override fun onRightClick() {
+        clickAt(curX, curY, 650L)
+    }
+
+    private fun recordDrag() {
+        dragMoved = true
+        if (dragT0 == 0L) dragT0 = SystemClock.uptimeMillis()
+        val n = dragPts.size
+        if (n >= 1200) return
+        if (n == 0 || hypot(curX - dragPts[n - 2], curY - dragPts[n - 1]) >= 4f) {
+            dragPts.add(curX)
+            dragPts.add(curY)
         }
+    }
+
+    override fun onDragStart() {
+        dragging = true
+        dragMoved = false
+        dragPts.clear()
+        dragT0 = 0L
+        dragStartX = curX
+        dragStartY = curY
     }
 
     override fun onDragEnd() {
-        if (gMode == G_DRAG) {
-            gEnd()
-        } else if (dragSkipped && !dragMoved) {
-            onTap()
+        if (!dragging) return
+        dragging = false
+        val straight = hypot(curX - dragStartX, curY - dragStartY)
+        if (!dragMoved || (straight < 8f && dragPts.size < 6)) {
+            clickAt(curX, curY, 45L)
+            return
         }
-        dragSkipped = false
+        val path = Path()
+        path.moveTo(dragStartX, dragStartY)
+        var minX = min(dragStartX, curX)
+        var maxX = max(dragStartX, curX)
+        var minY = min(dragStartY, curY)
+        var maxY = max(dragStartY, curY)
+        var i = 0
+        while (i + 1 < dragPts.size) {
+            val px = dragPts[i]
+            val py = dragPts[i + 1]
+            path.lineTo(px, py)
+            minX = min(minX, px)
+            maxX = max(maxX, px)
+            minY = min(minY, py)
+            maxY = max(maxY, py)
+            i += 2
+        }
+        path.lineTo(curX, curY)
+        val dur = (SystemClock.uptimeMillis() - dragT0).coerceIn(200L, 6000L)
+        haptic()
+        val hold = st.dragHold.toLong()
+        if (hold > 0L) {
+            val a = GestureDescription.StrokeDescription(
+                Path().apply { moveTo(dragStartX, dragStartY) }, 0L, hold, true
+            )
+            val b = a.continueStroke(path, 0L, dur, false)
+            val jb = Job(
+                GestureDescription.Builder().addStroke(b).build(),
+                minX, minY, maxX, maxY, dur
+            )
+            val ja = Job(
+                GestureDescription.Builder().addStroke(a).build(),
+                dragStartX, dragStartY, dragStartX, dragStartY, hold, jb
+            )
+            enqueue(ja)
+        } else {
+            val s = GestureDescription.StrokeDescription(path, 0L, dur)
+            enqueue(
+                Job(GestureDescription.Builder().addStroke(s).build(), minX, minY, maxX, maxY, dur)
+            )
+        }
     }
 
-    override fun onScrollStart() {
-        if (underPad(curX, curY) || !gIdle()) return
-        originX = curX
-        originY = curY
-        accX = 0f
-        accY = 0f
-        if (gStart(curX, curY)) gMode = G_SCROLL
+    override fun onScrollGesture(dx: Float, dy: Float, durMs: Long) {
+        val k = 2.4f * st.scrollSens * (if (st.scrollReverse) -1f else 1f)
+        var vx = dx * k
+        var vy = dy * k
+        val len = hypot(vx, vy)
+        if (len < 30f) return
+        val maxLen = min(screenW, screenH) * 0.8f
+        if (len > maxLen) {
+            vx *= maxLen / len
+            vy *= maxLen / len
+        }
+        var x0 = curX - vx / 2
+        var x1 = curX + vx / 2
+        var y0 = curY - vy / 2
+        var y1 = curY + vy / 2
+        val m = 6f
+        val shx = when {
+            min(x0, x1) < m -> m - min(x0, x1)
+            max(x0, x1) > screenW - m -> (screenW - m) - max(x0, x1)
+            else -> 0f
+        }
+        val shy = when {
+            min(y0, y1) < m -> m - min(y0, y1)
+            max(y0, y1) > screenH - m -> (screenH - m) - max(y0, y1)
+            else -> 0f
+        }
+        x0 += shx
+        x1 += shx
+        y0 += shy
+        y1 += shy
+        val dur = durMs.coerceIn(120L, 700L)
+        val p = Path()
+        p.moveTo(x0, y0)
+        p.lineTo(x1, y1)
+        val g = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(p, 0L, dur))
+            .build()
+        enqueue(Job(g, min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1), dur))
     }
 
-    override fun onScroll(dx: Float, dy: Float) {
-        if (gMode != G_SCROLL) return
-        val k = SCROLL_GAIN * (if (NATURAL_SCROLL) 1f else -1f)
-        val tx = (originX + accX + dx * k).coerceIn(2f, screenW - 3f)
-        val ty = (originY + accY + dy * k).coerceIn(2f, screenH - 3f)
-        accX = tx - originX
-        accY = ty - originY
-        gMove(tx, ty)
-    }
-
-    override fun onScrollEnd() {
-        if (gMode == G_SCROLL) gEnd()
+    override fun onPinchGesture(ratio: Float) {
+        val r = ratio.coerceIn(0.25f, 4f)
+        if (abs(r - 1f) < 0.12f) return
+        val base = min(screenW, screenH) * 0.14f
+        val cx = curX.coerceIn(screenW * 0.2f, screenW * 0.8f)
+        val cy = curY.coerceIn(8f, screenH - 8f)
+        val room = min(cx, screenW - cx) - 8f
+        val hs = base
+        var he = base * r
+        if (he > room) he = room
+        if (abs(he - hs) < 6f) return
+        val p1 = Path().apply {
+            moveTo(cx - hs, cy)
+            lineTo(cx - he, cy)
+        }
+        val p2 = Path().apply {
+            moveTo(cx + hs, cy)
+            lineTo(cx + he, cy)
+        }
+        val g = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(p1, 0L, 350L))
+            .addStroke(GestureDescription.StrokeDescription(p2, 0L, 350L))
+            .build()
+        val w = max(hs, he)
+        enqueue(Job(g, cx - w, cy, cx + w, cy, 350L))
     }
 
     override fun onEdge(action: Int) {
