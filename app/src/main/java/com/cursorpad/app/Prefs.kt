@@ -23,6 +23,18 @@ class Prefs(ctx: Context) {
         get() = prefs.getBoolean("enabled", true)
         set(v) { putB("enabled", v) }
 
+    var recordMode: Boolean
+        get() = prefs.getBoolean("recordMode", false)
+        set(v) { putB("recordMode", v) }
+
+    var welcomeDone: Boolean
+        get() = prefs.getBoolean("welcomeDone", false)
+        set(v) { putB("welcomeDone", v) }
+
+    var lang: String
+        get() = prefs.getString("lang", "fa") ?: "fa"
+        set(v) { prefs.edit().putString("lang", v).apply() }
+
     var shape: Int
         get() = prefs.getInt("shape", 0)
         set(v) { putI("shape", v) }
@@ -115,6 +127,8 @@ class Prefs(ctx: Context) {
     }
 
     fun reset() {
-        prefs.edit().clear().apply()
+        val l = lang
+        val w = welcomeDone
+        prefs.edit().clear().putString("lang", l).putBoolean("welcomeDone", w).apply()
     }
 }
