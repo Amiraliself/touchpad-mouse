@@ -87,8 +87,6 @@ class MouseService : AccessibilityService(), PadListener {
     private var padStartY = 0
     private var notifKey = -1
 
-    // ================= چرخه‌ی عمر =================
-
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
@@ -163,11 +161,10 @@ class MouseService : AccessibilityService(), PadListener {
         }
     }
 
-    // ================= اعلان ثابت =================
-
     @Suppress("DEPRECATION")
     private fun updateNotification() {
-        val key = (if (st.notif) 2 else 0) + (if (st.enabled) 1 else 0)
+        val en = st.lang == "en"
+        val key = (if (st.notif) 2 else 0) + (if (st.enabled) 1 else 0) + (if (en) 4 else 0)
         if (key == notifKey) return
         notifKey = key
         if (!st.notif) {
@@ -175,9 +172,10 @@ class MouseService : AccessibilityService(), PadListener {
             return
         }
         runCatching {
+            val title = if (en) "Touchpad Mouse" else "نشانگر موس"
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             nm.createNotificationChannel(
-                NotificationChannel(CHANNEL, "نشانگر موس", NotificationManager.IMPORTANCE_LOW)
+                NotificationChannel(CHANNEL, title, NotificationManager.IMPORTANCE_LOW)
             )
             val flags = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
             val openIntent = Intent(this, MainActivity::class.java)
@@ -187,20 +185,20 @@ class MouseService : AccessibilityService(), PadListener {
                 this, 1, Intent(ACTION_TOGGLE).setPackage(packageName), flags
             )
             val on = st.enabled
+            val text = if (en) (if (on) "On" else "Off") else (if (on) "روشن است" else "خاموش است")
+            val act = if (en) (if (on) "Turn off" else "Turn on") else (if (on) "خاموش کردن" else "روشن کردن")
             val n = Notification.Builder(this, CHANNEL)
                 .setSmallIcon(R.drawable.ic_tile)
-                .setContentTitle("نشانگر موس")
-                .setContentText(if (on) "روشن است" else "خاموش است")
+                .setContentTitle(title)
+                .setContentText(text)
                 .setContentIntent(open)
                 .setOngoing(true)
-                .addAction(R.drawable.ic_tile, if (on) "خاموش کردن" else "روشن کردن", tog)
+                .addAction(R.drawable.ic_tile, act, tog)
                 .build()
             val ok = runCatching { startForeground(NOTIF_ID, n) }.isSuccess
             if (!ok) nm.notify(NOTIF_ID, n)
         }
     }
-
-    // ================= پنجره‌ها =================
 
     @Suppress("DEPRECATION")
     private fun readScreen() {
@@ -219,14 +217,12 @@ class MouseService : AccessibilityService(), PadListener {
     private fun addOverlays() {
         val dens = resources.displayMetrics.density
 
-        // تاچ‌پد (با FLAG_SECURE تا توی فیلم صفحه ضبط نشود)
         val tv = TouchpadView(this, this)
         val pw = (st.padWidthDp * dens).toInt()
         val plp = LP(
             pw, (pw * 0.62f).toInt(),
             LP.TYPE_ACCESSIBILITY_OVERLAY,
-            LP.FLAG_NOT_FOCUSABLE or LP.FLAG_LAYOUT_IN_SCREEN or
-                LP.FLAG_LAYOUT_NO_LIMITS or LP.FLAG_SECURE,
+            LP.FLAG_NOT_FOCUSABLE or LP.FLAG_LAYOUT_IN_SCREEN or LP.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         )
         plp.gravity = Gravity.TOP or Gravity.START
@@ -235,7 +231,6 @@ class MouseService : AccessibilityService(), PadListener {
         placePad()
         wm.addView(tv, plp)
 
-        // نشانگر (تمام‌صفحه، غیرقابل‌لمس، روی تاچ‌پد)
         val cv = CursorView(this)
         val clp = LP(
             LP.MATCH_PARENT, LP.MATCH_PARENT,
@@ -299,7 +294,7 @@ class MouseService : AccessibilityService(), PadListener {
         val lp = padLp
         val pv = pad
         if (lp != null && pv != null) {
-            pv.alpha = st.padAlpha / 100f
+            pv.alpha = if (st.recordMode) 0f else st.padAlpha / 100f
             pv.edgeEnabled = st.edge
             pv.locked = st.padLocked
             pv.rightBtn = st.rightBtn
@@ -340,8 +335,6 @@ class MouseService : AccessibilityService(), PadListener {
             v.vibrate(VibrationEffect.createOneShot(14, 110))
         }
     }
-
-    // ================= صف ژست‌ها (بعد از برداشتن انگشت اجرا می‌شوند) =================
 
     private inner class Runner(val j: Job) {
         var done = false
@@ -404,8 +397,6 @@ class MouseService : AccessibilityService(), PadListener {
             .build()
         enqueue(Job(g, x, y, x, y, dur))
     }
-
-    // ================= PadListener =================
 
     override fun onMove(dx: Float, dy: Float, dtMs: Long) {
         var f = st.speed
