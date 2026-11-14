@@ -1,0 +1,25 @@
+name: Create signing key
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  keygen:
+    runs-on: ubuntu-latest
+    env:
+      KEY_PASS: ${{ secrets.KEY_PASS }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create and encrypt keystore
+        run: |
+          if [ -z "$KEY_PASS" ]; then echo "Secret KEY_PASS is not set"; exit 1; fi
+          if [ -f signing/release.jks.enc ]; then echo "Key already exists. Not overwriting."; exit 1; fi
+          mkdir -p signing
+          keytool -genkeypair -keystore release.jks -storetype PKCS12 -alias cursorpad -keyalg RSA -keysize 2048 -validity 10000 -storepass "$KEY_PASS" -keypass "$KEY_PASS" -dname "CN=CursorPad, O=CursorPad, C=IR"
+          openssl enc -aes-256-cbc -pbkdf2 -salt -in release.jks -out signing/release.jks.enc -pass env:KEY_PASS
+          rm release.jks
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add signing/release.jks.enc
+          git commit -m "Add encrypted signing key"
+          git push
