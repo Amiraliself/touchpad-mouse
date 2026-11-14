@@ -2,4 +2,5 @@
 <resources>
     <string name="app_name">نشانگر موس</string>
     <string name="service_desc">برای نمایش نشانگر موس، کلیک، اسکرول و کشیدن روی صفحه نیاز است.</string>
+    <string name="tile_record">حالت ضبط</string>
 </resources>
