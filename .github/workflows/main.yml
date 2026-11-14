@@ -17,13 +17,40 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.9"
-      - run: gradle assembleDebug --no-daemon --stacktrace
+      - name: Prepare signing key
+        env:
+          KEY_PASS: ${{ secrets.KEY_PASS }}
+        run: |
+          if [ -n "$KEY_PASS" ] && [ -f signing/release.jks.enc ]; then
+            openssl enc -d -aes-256-cbc -pbkdf2 -in signing/release.jks.enc -out "$RUNNER_TEMP/release.jks" -pass env:KEY_PASS
+            echo "KEYSTORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+            echo "Signing with release key"
+          else
+            echo "No release key found; building debug APK"
+          fi
+      - name: Build
+        env:
+          KEY_PASS: ${{ secrets.KEY_PASS }}
+        run: |
+          if [ -n "$KEYSTORE_FILE" ]; then
+            gradle assembleRelease --no-daemon --stacktrace
+          else
+            gradle assembleDebug --no-daemon --stacktrace
+          fi
+      - name: Collect APK
+        run: |
+          mkdir -p out
+          if [ -n "$KEYSTORE_FILE" ]; then
+            cp app/build/outputs/apk/release/*.apk out/
+          else
+            cp app/build/outputs/apk/debug/*.apk out/
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: CursorPad-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: out/*.apk
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
           name: CursorPad build ${{ github.run_number }}
-          files: app/build/outputs/apk/debug/app-debug.apk
+          files: out/*.apk
