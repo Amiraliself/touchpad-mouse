@@ -11,9 +11,9 @@ android {
     defaultConfig {
         applicationId = "com.cursorpad.app"
         minSdk = 26
-        targetSdk = 33
-        versionCode = 2
-        versionName = "2.0"
+        targetSdk = 34
+        versionCode = 3
+        versionName = "2.0.1"
     }
 
     signingConfigs {
