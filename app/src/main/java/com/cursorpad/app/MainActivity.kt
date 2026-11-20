@@ -580,6 +580,58 @@ fun WBody(text: String, align: TextAlign) {
     )
 }
 
+// ======================= مایکت =======================
+
+@Composable
+fun MyketSection() {
+    val ctx = LocalContext.current
+    val fail = tr("مایکت روی گوشی نصب نیست", "Myket is not installed")
+    val pkg = ctx.packageName
+    Section(tr("مایکت", "Myket"), "⭐", Orange) {
+        Text(
+            tr(
+                "اگر از برنامه راضی بودی، در مایکت امتیاز و نظر بده.",
+                "If you like the app, rate it and leave a comment on Myket."
+            ),
+            color = Muted, fontSize = 14.sp, lineHeight = 22.sp
+        )
+        Button(
+            onClick = {
+                safeStart(ctx, Intent(Intent.ACTION_VIEW, Uri.parse("myket://comment?id=" + pkg)), fail)
+            },
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = Orange,
+                contentColor = Color(0xFF1B1200)
+            )
+        ) {
+            Text(tr("⭐ امتیاز و نظر در مایکت", "⭐ Rate & comment on Myket"), fontWeight = FontWeight.Bold)
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Button(
+                onClick = {
+                    safeStart(ctx, Intent(Intent.ACTION_VIEW, Uri.parse("myket://details?id=" + pkg)), fail)
+                },
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0x33FFFFFF),
+                    contentColor = Color.White
+                )
+            ) { Text(tr("📱 صفحه‌ی برنامه", "📱 App page"), fontSize = 13.sp) }
+            Button(
+                onClick = {
+                    safeStart(ctx, Intent(Intent.ACTION_VIEW, Uri.parse("myket://developer/" + pkg)), fail)
+                },
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0x33FFFFFF),
+                    contentColor = Color.White
+                )
+            ) { Text(tr("🧩 برنامه‌های دیگر", "🧩 More apps"), fontSize = 13.sp) }
+        }
+    }
+}
+
 // ======================= تنظیمات =======================
 
 @Composable
@@ -965,6 +1017,8 @@ fun HomeTab(p: Prefs, tick: Int, onLang: (String) -> Unit) {
             }
         }
 
+        MyketSection()
+
         Button(
             onClick = { showDialog = true },
             modifier = Modifier.fillMaxWidth(),
@@ -1302,6 +1356,7 @@ fun ContactTab() {
                 )
             }
         )
+        MyketSection()
         Section(tr("نکته", "Tip"), "💡", Orange) {
             Text(
                 tr(
@@ -1312,7 +1367,7 @@ fun ContactTab() {
             )
         }
         Text(
-            tr("نشانگر موس — نسخه‌ی ۲٫۰", "Touchpad Mouse — version 2.0"),
+            tr("نشانگر موس — نسخه‌ی ۲٫۱", "Touchpad Mouse — version 2.1"),
             color = Muted,
             fontSize = 12.sp
         )
